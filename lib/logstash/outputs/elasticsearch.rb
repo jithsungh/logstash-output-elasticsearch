@@ -239,9 +239,27 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   # appends “{now/d}-000001” by default for new index creation, subsequent rollover indices will increment based on this pattern i.e. “000002”
   # {now/d} is date math, and will insert the appropriate value automatically.
   config :ilm_pattern, :validate => :string, :default => '{now/d}-000001'
-
   # ILM policy to use, if undefined the default policy will be used.
   config :ilm_policy, :validate => :string, :default => DEFAULT_POLICY
+  # When using dynamic ILM with sprintf patterns, automatically create missing policies
+  # with the default ILM policy configuration. Set to false to require manual policy creation.
+  config :ilm_auto_create_policy, :validate => :boolean, :default => true
+
+  # Fallback policy to use when a custom policy doesn't exist and auto-creation fails or is disabled.
+  # If not specified, errors will be raised for missing policies.
+  config :ilm_policy_fallback, :validate => :string, :default => nil
+
+  # When using dynamic ILM with sprintf patterns, automatically create index templates
+  # for each dynamic alias with proper settings and mappings. Set to false to require manual template creation.
+  config :ilm_auto_create_template, :validate => :boolean, :default => true
+
+  # Custom template settings for auto-created templates. This hash will be deep-merged with default settings.
+  # Example: { "index" => { "number_of_shards" => 1, "number_of_replicas" => 0 } }
+  config :ilm_template_settings, :validate => :hash, :default => {}
+
+  # Custom mappings for auto-created templates. This hash will be deep-merged with default mappings.
+  # Example: { "properties" => { "custom_field" => { "type" => "keyword" } } }
+  config :ilm_template_mappings, :validate => :hash, :default => {}
 
   attr_reader :client
   attr_reader :default_index
@@ -450,6 +468,19 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
 
   # Convert the event into a 3-tuple of action, params and event hash
   def event_action_tuple(event)
+    # Ensure dynamic ILM alias exists before creating the tuple
+    if ilm_in_use? && ilm_has_sprintf?
+      begin
+        ensure_dynamic_ilm_alias(event)
+      rescue => e
+        @logger.error("Failed to ensure dynamic ILM alias", 
+                     :error => e.message,
+                     :event => event.to_hash_with_metadata,
+                     :backtrace => e.backtrace.first(10))
+        raise EventMappingError, "Failed to ensure dynamic ILM alias: #{e.message}"
+      end
+    end
+    
     params = common_event_params(event)
     params[:_type] = get_event_type(event) if use_event_type?(nil)
 
@@ -566,6 +597,13 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   private :resolve_document_id
 
   def resolve_index!(event, event_index)
+    # If using dynamic ILM with sprintf, use the resolved rollover alias as the index
+    if ilm_in_use? && ilm_has_sprintf?
+      resolved_alias = resolve_ilm_rollover_alias(event)
+      raise IndexInterpolationError, resolved_alias if resolved_alias.match(/%{.*?}/) && dlq_on_failed_indexname_interpolation
+      return resolved_alias
+    end
+    
     sprintf_index = @event_target.call(event)
     raise IndexInterpolationError, sprintf_index if sprintf_index.match(/%{.*?}/) && dlq_on_failed_indexname_interpolation
     # if it's not a data stream, sprintf_index is the @index with resolved placeholders.
